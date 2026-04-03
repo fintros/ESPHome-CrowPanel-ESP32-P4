@@ -4,6 +4,9 @@ This document explains how to create a Python virtual environment, install ESPHo
 
 This guide is checked on the 10 inch ESP32-P4 Elecrow display: https://www.elecrow.com/crowpanel-advanced-10-1inch-esp32-p4-hmi-ai-display-1024x600-ips-touch-screen-wifi-6.html, but os also should works on smaller displays.
 
+![demo photo](img/demo.png)
+
+
 ## Requirements
 
 - Python 3.11 or newer is recommended for current ESPHome installations.
