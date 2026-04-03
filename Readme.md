@@ -313,6 +313,10 @@ Check these items first:
 
 Make sure the virtual environment is activated before running ESPHome commands.
 
+### ESPHome bug with PDM mics
+
+There is a bug in current version of ESPHome with suport of PDM microphones on ESP32-P4. Pul; request to ESPHome created already, but if you wull have error related to the mics on building stage - apply the following fix in the ESPHome components folder: https://github.com/esphome/esphome/pull/15333
+
 ### Troubleshooting RemoteWebViewServer
 
 #### The add-on starts but the screen stays blank
