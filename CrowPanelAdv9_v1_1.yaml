@@ -1,0 +1,484 @@
+substitutions:
+  # Predefined Wi‑Fi access point SSID
+  wifi_ap: "mir_internet"
+  # Predefined Wi‑Fi access point password
+  wifi_password: "P9WVxH1RAH"
+  # Fallback AP SSID used when main Wi‑Fi is not available
+  fallback_ap: "crowpanel-esp32-p4-1.1"
+  # Fallback AP password
+  fallback_ap_password: "CHANGE_ME"
+  # Default base URL for Home Assistant dashboards (used by Remote WebView)
+  ha_base_url: "http://homeassistant.local:8123/"
+  # Home Assistant API encryption key for this ESPHome device
+  ha_encryption_key: "v6Ag6XLoOtSmAjTejkPi+3ZTC+EmVDp/KOCKDugwS60="
+
+esphome:
+  name: crowpanel-esp32-p4
+  on_boot:
+    # Run after most components are initialized
+    priority: -100
+    then:
+      # Start inactivity timer (controls backlight & touch lock)
+      - script.execute: inactivity_timer
+      # Give network and API some time to come up
+      - delay: 3s
+      # Re‑apply last saved Remote WebView URL on boot
+      - lambda: |-
+          std::string full = id(rwv_url).state.c_str();
+          if (full.empty()) return;
+
+          // Strip scheme (http:// or https://)
+          std::string tmp = full;
+          auto pos = tmp.find("://");
+          if (pos != std::string::npos) tmp = tmp.substr(pos + 3);
+
+          // Extract host[:port] from host[:port]/path
+          std::string host_port;
+          auto slash = tmp.find('/');
+          host_port = (slash != std::string::npos) ? tmp.substr(0, slash) : tmp;
+
+          // Extract host only (drop port if present)
+          std::string host_only;
+          auto colon = host_port.find(':');
+          host_only = (colon != std::string::npos) ? host_port.substr(0, colon) : host_port;
+
+          // Use host from URL, but fixed Remote WebView port 8081
+          if (!host_only.empty()) {
+            id(rwv).set_server(host_only + ":8081");
+          }
+          // Set the target URL for Remote WebView
+          id(rwv).set_url(full);
+
+external_components:
+  # Local custom components directory (Remote WebView implementation)
+  - source: components
+    refresh: 0s
+    components: [ remote_webview ]
+
+esp32:
+  board: esp32-p4
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    # Enable PSRAM usage for code and read‑only data
+    sdkconfig_options:
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y
+      CONFIG_SPIRAM_RODATA: y
+
+    # Extra IDF components used by Remote WebView
+    components:
+      - name: "espressif/esp_websocket_client"
+        ref: 1.5.0
+      - name: "bitbank2/jpegdec"
+        source: https://github.com/strange-v/jpegdec-esphome
+
+# Serial logging configuration
+logger:
+  baud_rate: 115200
+  hardware_uart: UART0   # Use UART0 for logs
+  level: INFO
+
+# Native API for Home Assistant
+api:
+  encryption:
+    key: $ha_encryption_key
+
+# OTA updates over ESPHome
+ota:
+  - platform: esphome
+
+# ESP32‑Hosted Wi‑Fi6 module connection (ESP32‑C6 on the Waveshare board)
+esp32_hosted:
+  variant: ESP32C6
+  reset_pin: GPIO32
+  cmd_pin: GPIO19
+  clk_pin: GPIO18
+  d0_pin: GPIO17
+  d1_pin: GPIO16
+  d2_pin: GPIO15
+  d3_pin: GPIO14
+  active_high: true
+  sdio_frequency: 40000000
+
+wifi:
+  # Main Wi‑Fi credentials from substitutions
+  ssid: $wifi_ap
+  password: $wifi_password
+
+  # Fallback AP (captive portal) when Wi‑Fi cannot connect
+  ap:
+    ssid: $fallback_ap
+    password: $fallback_ap_password
+
+# Captive portal for initial configuration
+captive_portal:
+
+# PSRAM configuration (external RAM on ESP32‑P4)
+psram:
+  mode: hex
+  speed: 200MHz
+
+# Internal LDO regulator used to power some peripherals (e.g. display/touch)
+esp_ldo:
+  - channel: 3
+    voltage: 2.5V
+
+switch:
+  # Controls panel power for LCD and touch
+  - platform: gpio
+    pin: GPIO29
+    id: display_power
+    name: "Display Power"
+    restore_mode: ALWAYS_ON
+
+  # Amplifier power (active‑low on this board)
+  - platform: gpio
+    id: amp_power
+    name: "Speaker Power"
+    pin:
+      number: GPIO30
+      inverted: true
+    restore_mode: ALWAYS_ON
+
+  # Microphone routing switch (R/L channel selection on the board)
+  - platform: gpio
+    pin: GPIO20
+    id: mic_r_l
+    name: "Mic R-L"
+    restore_mode: ALWAYS_ON
+
+output:
+  # LEDC PWM output for LCD backlight control
+  - platform: ledc
+    pin: GPIO31
+    id: backlight_pwm
+    frequency: 1000 Hz
+
+light:
+  # Simple dimmable backlight light entity
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: back_light
+    restore_mode: ALWAYS_ON
+
+display:
+  # MIPI‑DSI display driver for Waveshare ESP32‑P4 7" LCD
+  - platform: mipi_dsi
+    id: my_display
+    model: WAVESHARE-ESP32-P4-WIFI6-TOUCH-LCD-7B
+    reset_pin:
+      number: 41
+    rotation: 0
+    # Drawing controlled manually by Remote WebView
+    update_interval: never
+    auto_clear_enabled: false
+    dimensions:
+      width: 1024
+      height: 600
+
+i2c:
+  # I²C bus for touch controller and other peripherals
+  - id: bus_a
+    sda: GPIO45
+    scl: GPIO46
+    frequency: 100kHz
+
+touchscreen:
+  # GT911 capacitive touch controller on the Waveshare panel
+  platform: gt911
+  reset_pin: GPIO40
+  interrupt_pin: GPIO42
+  transform:
+    mirror_x: false
+    mirror_y: false
+  # Any touch event wakes the backlight / restarts inactivity timer
+  on_touch:
+    then:
+      - script.execute: inactivity_timer
+
+remote_webview:
+  # Remote WebView client that streams HA dashboard to the LCD
+  id: rwv
+  # Initial dummy server; will be replaced from rwv_url on boot
+  server: 127.0.0.1:8081
+  # Initial dummy URL; will be replaced from rwv_url on boot
+  url: http://127.0.0.1/
+  full_frame_tile_count: 1
+  max_bytes_per_msg: 61440
+  jpeg_quality: 85
+
+i2s_audio:
+  # I2S bus for PDM microphone (clock only, data is on i2s_din_pin)
+  - id: i2s_mic
+    i2s_lrclk_pin: GPIO24
+  # I2S bus for external speaker amplifier
+  - id: i2s_spk
+    i2s_lrclk_pin: GPIO21
+    i2s_bclk_pin: GPIO22
+
+microphone:
+  # PDM digital microphone connected via I2S
+  - platform: i2s_audio
+    id: pdm_mic
+    i2s_audio_id: i2s_mic
+    i2s_din_pin: GPIO26
+    adc_type: external
+    pdm: true
+
+speaker:
+  # External NS4168 I2S speaker amplifier
+  - platform: i2s_audio
+    id: ns4168_speaker
+    i2s_audio_id: i2s_spk
+    i2s_dout_pin: GPIO23
+    dac_type: external
+
+media_player:
+  # Media player abstraction on top of the I2S speaker
+  - platform: speaker
+    id: speaker_media
+    name: "Speaker"
+    announcement_pipeline:
+      speaker: ns4168_speaker
+
+    # If an announcement starts while mic is capturing, stop wake word engine
+    on_announcement:
+      - if:
+          condition:
+            - microphone.is_capturing:
+          then:
+            - script.execute: stop_wake_word
+    # When idle after announcement, restart wake word engine
+    on_idle:
+      - script.execute: start_wake_word
+
+micro_wake_word:
+  # On‑device wake word detection using ESPHome micro_wake_word
+  on_wake_word_detected:
+    - logger.log: "Wake word detected"
+    - script.execute: inactivity_timer
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
+
+  # Voice Activity Detection to suppress noise‑only events
+  vad:
+    model: vad
+    probability_cutoff: 0.85
+    sliding_window_size: 2
+
+  # Wake word models running locally
+  models:
+    - model: hey_jarvis
+#      probability_cutoff: 0.8
+#      sliding_window_size: 5
+    - model: okay_nabu
+#      sliding_window_size: 5
+#      probability_cutoff: 0.8
+
+voice_assistant:
+  # ESPHome voice assistant integration with Home Assistant Assist
+  id: va
+  micro_wake_word:      # bind to micro_wake_word component above
+  microphone:
+    microphone: pdm_mic
+    channels: 0
+    gain_factor: 2
+  media_player: speaker_media
+#  noise_suppression_level: 2
+#  auto_gain: 31dBFS
+  on_end:
+    # Handle "nevermind" case with no TTS announcement
+    - wait_until:
+        condition:
+          - media_player.is_announcing:
+        timeout: 0.5s
+    # Restart only micro_wake_word if enabled; streaming wake words restart automatically
+    - if:
+        condition:
+          - lambda: |-
+              return id(wake_word_engine_location).current_option() == "On device";
+        then:
+          - wait_until:
+              - and:
+                  - not:
+                      voice_assistant.is_running:
+                  - not:
+                      speaker.is_playing:
+          - lambda: id(va).set_use_wake_word(false);
+          - micro_wake_word.start:
+  on_client_connected:
+    # Delay a bit so HA API is fully ready, then start wake word engine
+    - delay: 2s
+    - script.execute: start_wake_word
+  on_client_disconnected:
+    # Stop wake word when HA disconnects
+    - script.execute: stop_wake_word
+
+text:
+  # Text entity used to configure Remote WebView URL from HA
+  - platform: template
+    id: rwv_url
+    name: "Remote WebView URL"
+    optimistic: true
+    restore_value: true          # persist last URL locally in flash
+    mode: TEXT
+    min_length: 1
+    initial_value: $ha_base_url  # default value if nothing stored yet
+    set_action:
+      - lambda: |-
+          std::string full = std::string(x.c_str());
+
+          // Strip scheme
+          std::string tmp = full;
+          auto pos = tmp.find("://");
+          if (pos != std::string::npos) {
+            tmp = tmp.substr(pos + 3);
+          }
+
+          // Extract host[:port]
+          std::string host_only;
+          auto slash = tmp.find('/');
+          std::string host_port = (slash != std::string::npos) ? tmp.substr(0, slash) : tmp;
+
+          // Drop port from HA URL, keep only hostname
+          auto colon = host_port.find(':');
+          if (colon != std::string::npos) {
+            host_only = host_port.substr(0, colon);
+          } else {
+            host_only = host_port;
+          }
+
+          // Configure Remote WebView server as <host>:8081
+          if (!host_only.empty()) {
+            std::string server = host_only + ":8081";
+            id(rwv).set_server(server);
+            ESP_LOGI("remote_webview", "Server set to: %s", server.c_str());
+          } else {
+            ESP_LOGW("remote_webview", "Failed to parse host from URL: %s", full.c_str());
+          }
+
+          // Apply URL to Remote WebView (immediately if connected, else queue)
+          if (!id(rwv).open_url(full)) {
+            id(rwv).set_url(full);
+            ESP_LOGI("remote_webview", "URL queued (not connected): %s", full.c_str());
+          }
+
+select:
+  # Runtime switch: where wake word is handled (HA or on‑device)
+  - platform: template
+    entity_category: config
+    name: Wake word engine location
+    id: wake_word_engine_location
+    optimistic: true
+    restore_value: true
+    options:
+      - In Home Assistant
+      - On device
+    initial_option: On device
+    on_value:
+      # Use streaming wake word in HA
+      - if:
+          condition:
+            lambda: return x == "In Home Assistant";
+          then:
+            - micro_wake_word.stop:
+            - delay: 500ms
+            - lambda: id(va).set_use_wake_word(true);
+            - voice_assistant.start_continuous:
+      # Use on‑device micro_wake_word
+      - if:
+          condition:
+            lambda: return x == "On device";
+          then:
+            - lambda: id(va).set_use_wake_word(false);
+            - voice_assistant.stop:
+            - delay: 500ms
+            - micro_wake_word.start:
+
+script:
+  # Helper to start appropriate wake word engine depending on select state
+  - id: start_wake_word
+    then:
+      - if:
+          condition:
+            and:
+              - not:
+                  - voice_assistant.is_running:
+              - lambda: |-
+                  return id(wake_word_engine_location).current_option() == "On device";
+          then:
+            - lambda: id(va).set_use_wake_word(false);
+            - micro_wake_word.start:
+      - if:
+          condition:
+            and:
+              - not:
+                  - voice_assistant.is_running:
+              - lambda: |-
+                  return id(wake_word_engine_location).current_option() == "In Home Assistant";
+          then:
+            - lambda: id(va).set_use_wake_word(true);
+            - voice_assistant.start_continuous:
+
+  # Helper to stop wake word engine depending on where it runs
+  - id: stop_wake_word
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(wake_word_engine_location).current_option() == "In Home Assistant";
+          then:
+            - lambda: id(va).set_use_wake_word(false);
+            - voice_assistant.stop:
+      - if:
+          condition:
+            lambda: |-
+              return id(wake_word_engine_location).current_option() == "On device";
+          then:
+            - micro_wake_word.stop:
+
+  # Backlight / touch inactivity timer:
+  # - wakes display & enables touch on any activity
+  # - turns display off and disables touch after timeout
+  - id: inactivity_timer
+    mode: restart
+    then:
+      # If backlight is currently off, turn it on and re‑enable touch
+      - if:
+          condition:
+            light.is_off: back_light
+          then:
+            - light.turn_on:
+                id: back_light
+            - delay: 0.5s
+            - lambda: |-
+                id(rwv).disable_touch(false);
+      # Wait for inactivity duration
+      - delay: 60s
+      # Turn off backlight
+      - light.turn_off:
+          id: back_light
+      # Disable touch so screen does not react while "sleeping"
+      - lambda: |-
+          id(rwv).disable_touch(true);
+
+update:
+  - platform: esp32_hosted
+    id: esp_hosted_fw
+    type: embedded
+    path: network_adapter_esp32c6.bin
+    sha256: 62cbea4ebdfbfea6bce961a519185ac6ff55080d393cab5653485d64822b7d86
+
+# Example of LVGL usage; if LVGL is enabled, Remote WebView cannot be used
+# lvgl:
+#   buffer_size: 100%
+#   byte_order: little_endian
+#
+#   pages:
+#     - id: main_page
+#       widgets:
+#         - label:
+#             id: hello_label
+#             text: "Hello LVGL"
+#             align: CENTER
